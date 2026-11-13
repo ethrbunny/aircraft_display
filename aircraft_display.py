@@ -7,10 +7,10 @@ import requests
 import json
 import traceback
 import math
+import os
 
-from datetime import datetime
+from datetime import datetime,timedelta
 from rgbmatrix import RGBMatrix, RGBMatrixOptions, graphics
-
 
 # --------------------------------------------------
 # Location and API
@@ -20,18 +20,36 @@ LAT = 45.44862010151184
 LON = -122.68521259844668
 RADIUS_NM = 10
 
-API_URL = (
-    f"https://api.adsb.lol/v2/point/"
-    f"{LAT}/{LON}/{RADIUS_NM}"
-)
-
-MIL_API_URL = "https://api.adsb.lol/v2/mil"
+# Rotate between independent community networks. Both nearby-aircraft
+# endpoints return ADSBexchange-compatible aircraft records.
+API_PROVIDERS = [
+    {
+        "name": "adsb.lol",
+        "point_url": (
+            f"https://api.adsb.lol/v2/point/{LAT}/{LON}/{RADIUS_NM}"
+        ),
+        "mil_url": "https://api.adsb.lol/v2/mil",
+    },
+    {
+        "name": "adsb.fi",
+        "point_url": (
+            f"https://opendata.adsb.fi/api/v3/lat/{LAT}/lon/{LON}/dist/{RADIUS_NM}"
+        ),
+        "mil_url": "https://opendata.adsb.fi/api/v2/mil",
+    },
+]
 
 REFRESH_SECONDS = 10
+# Each provider is used on alternate refreshes, so each receives a point
+# request about every 20 seconds. Refresh each provider's military list no
+# more than once per minute.
 MIL_REFRESH_SECONDS = 60
 PAGE_SECONDS = 6
 
 DB_FILE = "/var/lib/aircraft-display/aircraft_sightings.db"
+# Keep aircraft.json beside this script (for example, /root/aircraft.json).
+AIRCRAFT_REGISTRY_FILE = "/var/lib/aircraft-display/aircraft.json"
+AIRCRAFT_REGISTRY = {}
 
 AIRCRAFT_TYPES = {
     "F15": "F-15",
@@ -57,7 +75,52 @@ REFRESH_SECONDS = 10
 MAX_RETRY_SECONDS = 120
 OBSERVATION_LOG_INTERVAL = 30  # seconds per aircraft and API source
 
+def load_aircraft_registry(path=AIRCRAFT_REGISTRY_FILE):
+    """Load the JSON-array aircraft registry."""
+    registry = {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+
+            hex_id = str(record.get("icao24") or "").strip().lower()
+            if hex_id:
+                registry[hex_id] = record
+
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARNING: could not load aircraft registry {path}: {exc}")
+
+    print(f"Aircraft registry: loaded {len(registry):,} records from {path}")
+    return registry
+
+def enrich_aircraft_from_registry(a):
+    """Fill missing ADS-B registration/type details using ICAO hex."""
+    hex_id = str(a.get("hex") or "").strip().lower()
+    record = AIRCRAFT_REGISTRY.get(hex_id)
+    if not record:
+        return
+
+    if not (a.get("r") or "").strip():
+        registration = record.get("registration")
+        if registration:
+            a["r"] = registration
+
+    # The registry's operator field contains the descriptive aircraft model
+    # (e.g. 'CESSNA 182 Skylane'); its model field is often just '00'.
+    if record.get("operator"):
+        a["_registry_operator"] = record["operator"]
+    if not a.get("t") and record.get("typecode"):
+        a["t"] = record["typecode"]
+
+
 def aircraft_name(a):
+    model = a.get("_registry_operator")
+    if model:
+        return model
     code = a.get("t") or "N/A"
     return AIRCRAFT_TYPES.get(code, code)
 
@@ -65,7 +128,8 @@ def aircraft_name(a):
 # Database
 # --------------------------------------------------
 
-db = sqlite3.connect(DB_FILE)
+db = sqlite3.connect(DB_FILE, timeout=10)
+db.execute("PRAGMA busy_timeout = 10000")
 
 db.execute("""
 CREATE TABLE IF NOT EXISTS sightings (
@@ -155,6 +219,64 @@ def distance_nm(lat1, lon1, lat2, lon2):
     )
     return 3440.065 * 2 * math.asin(min(1.0, math.sqrt(h)))
 
+_last_retention_cleanup = None
+_last_retention_attempt = None
+
+
+def purge_old_non_mil_observations():
+    """
+    Delete non-military raw observations older than seven days.
+
+    Use the application's existing SQLite connection. This function must only
+    be called after any surrounding `with db:` logging transaction has exited.
+    """
+    global _last_retention_cleanup, _last_retention_attempt
+
+    now = datetime.now()
+
+    if (
+        _last_retention_cleanup is not None
+        and (now - _last_retention_cleanup).total_seconds() < 86400
+    ):
+        return
+
+    if (
+        _last_retention_attempt is not None
+        and (now - _last_retention_attempt).total_seconds() < 300
+    ):
+        return
+
+    _last_retention_attempt = now
+    cutoff = (now - timedelta(days=7)).isoformat(timespec="seconds")
+
+    try:
+        # Reuse the main connection rather than opening a second connection.
+        with db:
+            cursor = db.execute(
+                """
+                DELETE FROM api_observations
+                WHERE military = 0
+                  AND timestamp < ?
+                """,
+                (cutoff,),
+            )
+            deleted = cursor.rowcount
+
+        _last_retention_cleanup = datetime.now()
+
+        if deleted:
+            print(
+                f"Database cleanup: deleted {deleted} "
+                "non-military observations older than 7 days"
+            )
+        else:
+            print("Database cleanup: nothing older than 7 days to delete")
+
+    except sqlite3.OperationalError as e:
+        print(f"Database cleanup temporarily unavailable: {e}")
+
+    except Exception as e:
+        print(f"Database cleanup failed: {e}")
 
 def log_api_observations(source, aircraft, military_hexes=None,
                          nearby_only=False):
@@ -246,6 +368,10 @@ def log_api_observations(source, aircraft, military_hexes=None,
             last_observation_logged[cache_key] = now
             inserted += 1
 
+    # Run only after the logging transaction has committed. Calling cleanup
+    # inside `with db:` was causing SQLite to lock against its own transaction.
+    purge_old_non_mil_observations()
+
     for key in list(last_observation_logged):
         if now - last_observation_logged[key] > 3600:
             del last_observation_logged[key]
@@ -323,8 +449,8 @@ def log_sightings(aircraft):
 # Military aircraft lookup
 # --------------------------------------------------
 
-military_hexes = set()
-last_mil_refresh = 0
+military_hexes_by_provider = {}
+last_mil_refresh_by_provider = {}
 
 def climb_text(a):
     vr = a.get("baro_rate")
@@ -340,52 +466,53 @@ def climb_text(a):
 
     return "LEVEL"
 
-def get_military_hexes():
-
-    global military_hexes, last_mil_refresh
-
+def get_military_hexes(provider):
+    """Get and cache the military list independently for each provider."""
+    name = provider["name"]
+    cached = military_hexes_by_provider.get(name, set())
     now = time.monotonic()
 
-    if now - last_mil_refresh < MIL_REFRESH_SECONDS:
-        return military_hexes
+    if now - last_mil_refresh_by_provider.get(name, 0) < MIL_REFRESH_SECONDS:
+        return cached
 
-    last_mil_refresh = now
+    last_mil_refresh_by_provider[name] = now
 
     try:
         response = requests.get(
-            MIL_API_URL,
-            timeout=15
+            provider["mil_url"],
+            timeout=15,
+            headers={"User-Agent": "HomeAircraftDisplay/1.0"}
         )
-
         response.raise_for_status()
 
         data = response.json()
         military_aircraft = data.get("ac", [])
-
-        military_hexes = {
+        cached = {
             a.get("hex", "").lower()
             for a in military_aircraft
             if a.get("hex")
         }
+        military_hexes_by_provider[name] = cached
 
-        # /v2/mil is worldwide; store only positioned aircraft in local range.
+        # /mil is worldwide; store only positioned aircraft in local range.
         log_api_observations(
-            "mil",
+            f"mil:{name}",
             military_aircraft,
-            military_hexes=military_hexes,
+            military_hexes=cached,
             nearby_only=True
         )
 
         print(
-            "Military database:",
-            len(military_hexes),
+            f"Military database ({name}):",
+            len(cached),
             "aircraft; local observations logged"
         )
 
     except Exception as e:
-        print("Military API error:", e)
+        # Keep the last successful cache if a provider is temporarily down.
+        print(f"Military API error ({name}):", e)
 
-    return military_hexes
+    return cached
 
 
 # --------------------------------------------------
@@ -403,7 +530,7 @@ font.LoadFont("/root/rpi-rgb-led-matrix/fonts/5x8.bdf")
 options = RGBMatrixOptions()
 options.rows = 64
 options.cols = 64
-options.chain_length = 1
+options.chain_length = 2
 options.parallel = 1
 options.hardware_mapping = "adafruit-hat"
 options.gpio_slowdown = 2
@@ -456,10 +583,12 @@ def aircraft_style(a):
 # Aircraft retrieval
 # --------------------------------------------------
 
-def get_aircraft():
+def get_aircraft(provider):
+    name = provider["name"]
     response = requests.get(
-        API_URL,
-        timeout=15
+        provider["point_url"],
+        timeout=15,
+        headers={"User-Agent": "HomeAircraftDisplay/1.0"}
     )
 
     response.raise_for_status()
@@ -467,12 +596,12 @@ def get_aircraft():
     data = response.json()
     raw_aircraft = data.get("ac", [])
 
-    # Military database is cached separately.
-    mil_hexes = get_military_hexes()
+    # Military database is cached separately for each provider.
+    mil_hexes = get_military_hexes(provider)
 
     # Log the complete local response before any display filters are applied.
     log_api_observations(
-        "point",
+        f"point:{name}",
         raw_aircraft,
         military_hexes=mil_hexes,
         nearby_only=False
@@ -500,6 +629,7 @@ def get_aircraft():
             continue
 
         hex_id = (a.get("hex") or "").lower()
+        enrich_aircraft_from_registry(a)
 
         # dbFlags bit 0 indicates military.
         db_flags = a.get("dbFlags", 0)
@@ -530,149 +660,221 @@ def get_aircraft():
 # --------------------------------------------------
 
 def altitude_text(a):
-
-    alt = a.get(
-        "alt_baro",
-        a.get("alt_geom")
-    )
+    alt = a.get("alt_baro", a.get("alt_geom"))
 
     if alt == "ground":
-        return "GROUND"
+        return "ON GROUND"
 
     if isinstance(alt, (int, float)):
-        return f"FL{int(alt // 100):03d}"
+        return f"ALT {int(alt)}"
 
     return "ALT ---"
 
 
 def bearing_text(a):
-
-    bearing = a.get("dir")
+    # ADSB.lol point responses normally use `track`; retain `dir` fallback.
+    bearing = a.get("track", a.get("dir"))
 
     if not isinstance(bearing, (int, float)):
         return "---"
 
-    directions = [
-        "N", "NE", "E", "SE",
-        "S", "SW", "W", "NW"
-    ]
-
-    return directions[
-        int((bearing + 22.5) / 45) % 8
-    ]
+    directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    return directions[int((bearing + 22.5) / 45) % 8]
 
 
-# --------------------------------------------------
-# Aircraft display
-# --------------------------------------------------
-def draw_aircraft(a, y):
-
-    military = a.get("military", False)
-
-    callsign = (a.get("flight") or "").strip()
-
-    callsign = (
-        callsign
+def aircraft_identity(a):
+    return (
+        (a.get("flight") or "").strip()
         or a.get("r")
-        or a.get("hex", "UNKNOWN")
+        or a.get("hex")
+        or "UNKNOWN"
     )
 
-    aircraft_type = a.get("t") or "UNKNOWN"
-    distance = a.get("dst", 0)
-    speed = a.get("gs")
 
-    callsign_color, category_label = aircraft_style(a)
+# --------------------------------------------------
+# Recent military sightings cache
+# --------------------------------------------------
 
-    draw_text(1, y, callsign_color, callsign[:8])
+_recent_military_cache = []
+_last_recent_military_query = 0
 
-    if category_label:
-        draw_text(46, y, callsign_color, category_label)
 
-    # Aircraft type
-    draw_text(
-        1, y + 8, CYAN,
-        aircraft_name(a)[:8]
-    )
+def get_recent_military_sightings():
+    """Return military sightings from the last 24 hours, newest first."""
+    global _recent_military_cache, _last_recent_military_query
 
-    # Altitude
-    draw_text(
-        37, y + 8, WHITE,
-        altitude_text(a)
-    )
+    now = time.monotonic()
+    if now - _last_recent_military_query < 15:
+        return _recent_military_cache
 
-    # Distance
-    draw_text(
-        1, y + 16, YELLOW,
-        f"{distance:.1f}NM"
-    )
+    cutoff = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
 
-    # Ground speed
-    speed_text = (
-        f"{int(speed)}KT"
-        if isinstance(speed, (int, float))
-        else "---KT"
-    )
+    try:
+        rows = db.execute(
+            """
+            SELECT timestamp, hex, callsign, registration,
+                   aircraft_type, altitude, speed, distance
+            FROM sightings
+            WHERE timestamp >= ?
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (cutoff,),
+        ).fetchall()
 
-    draw_text(30, y + 16, YELLOW, speed_text)
+        _recent_military_cache = [
+            {
+                "timestamp": row[0],
+                "hex": row[1],
+                "callsign": row[2],
+                "registration": row[3],
+                "aircraft_type": row[4],
+                "altitude": row[5],
+                "speed": row[6],
+                "distance": row[7],
+            }
+            for row in rows
+        ]
+        _last_recent_military_query = now
+
+    except sqlite3.Error as e:
+        print(f"Recent military sightings query failed: {e}")
+
+    return _recent_military_cache
+
+
+# --------------------------------------------------
+# Aircraft display: 128x64 split into two 64x64 panels
+# --------------------------------------------------
+
+def draw_local_panel(aircraft, page, error=False):
+    """Show local aircraft; retain the last good data during feed outages."""
+    if error and aircraft:
+        # Keep showing the last successful response and make its age/status
+        # obvious rather than replacing useful aircraft data with an error.
+        draw_text(1, 7, RED, "STALE DATA")
+    else:
+        draw_text(1, 7, CYAN, "LOCAL 10NM")
+
+    if error and not aircraft:
+        draw_text(1, 27, RED, "API ERROR")
+        draw_text(1, 39, GREY, "RETRYING")
+        return
+
+    if not aircraft:
+        draw_text(1, 27, YELLOW, "NO AIRCRAFT")
+        draw_text(1, 39, GREY, "IN 10 NM")
+        return
+
+    a = aircraft[page % len(aircraft)]
+    color, _ = aircraft_style(a)
+
+    draw_text(1, 18, color, aircraft_identity(a)[:10])
+    draw_text(1, 25, CYAN, aircraft_name(a)[:10])
+    draw_text(1, 32, WHITE, altitude_text(a)[:10])
+
+    distance = _number(a.get("dst"))
+    distance_text = f"DST {distance:.1f}NM" if distance is not None else "DST ---"
+    draw_text(1, 40, YELLOW, distance_text[:10])
+
+    speed = _number(a.get("gs"))
+    speed_text = f"{int(speed)}KT" if speed is not None else "---KT"
+    motion_text = f"{speed_text} {bearing_text(a)}"
+    draw_text(1, 48, GREEN, motion_text[:10])
 
     # Climb / descent rate
     draw_text(
-        1, y + 24, GREEN,
+        1, 56, ORANGE,
         climb_text(a)
     )
 
-    # Heading
-    draw_text(
-        48, y + 24, WHITE,
-        bearing_text(a)
-    )
-# --------------------------------------------------
-# Screen
-# --------------------------------------------------
+def _short_altitude(altitude):
+    if altitude is None:
+        return "---"
+
+    try:
+        if str(altitude).lower() == "ground":
+            return "GND"
+        # Hundreds of feet keeps the value readable in the narrow panel.
+        return f"{int(float(altitude)) // 100:03d}"
+    except (TypeError, ValueError):
+        return "---"
+
+
+def draw_military_panel(aircraft):
+    """Show current military aircraft followed by recent logged sightings."""
+    current_military = [
+        a for a in aircraft
+        if a.get("military")
+    ]
+
+    draw_text(66, 7, RED, "MILITARY")
+    draw_text(114, 7, YELLOW, f"{len(current_military):02d}"[-2:])
+
+    entries = []
+    seen_hexes = set()
+
+    # Current aircraft take priority and are already sorted by distance.
+    for a in current_military:
+        hex_id = (a.get("hex") or "").lower()
+        if hex_id:
+            seen_hexes.add(hex_id)
+
+        entries.append({
+            "identity": aircraft_identity(a),
+            "altitude": a.get("alt_baro", a.get("alt_geom")),
+            "current": True,
+        })
+
+    # Fill remaining rows with recent military sightings from SQLite.
+    for sighting in get_recent_military_sightings():
+        hex_id = (sighting.get("hex") or "").lower()
+        if hex_id and hex_id in seen_hexes:
+            continue
+
+        if hex_id:
+            seen_hexes.add(hex_id)
+
+        entries.append({
+            "identity": (
+                (sighting.get("callsign") or "").strip()
+                or sighting.get("registration")
+                or sighting.get("hex")
+                or "UNKNOWN"
+            ),
+            "altitude": sighting.get("altitude"),
+            "current": False,
+        })
+
+        if len(entries) >= 5:
+            break
+
+    if not entries:
+        draw_text(66, 27, GREY, "NO MIL")
+        draw_text(66, 38, GREY, "SIGHTINGS")
+        draw_text(66, 51, GREY, "LAST 24H")
+        return
+
+    for index, entry in enumerate(entries[:5]):
+        y = 18 + index * 10
+        color = RED if entry["current"] else GREY
+        identity = str(entry["identity"])[:6].ljust(6)
+        altitude = _short_altitude(entry["altitude"])
+        # Ten characters fit within the 64-pixel panel using the 5x8 font.
+        draw_text(66, y, color, f"{identity} {altitude}")
+
 
 def draw_screen(aircraft, page, error=False):
-
     canvas.Clear()
 
-    count = len(aircraft)
+    # Subtle divider between the two physical 64x64 panels.
+    for y in range(64):
+        canvas.SetPixel(63, y, 55, 55, 55)
 
-    mil_count = sum(
-        1 for a in aircraft
-        if a.get("military")
-    )
-
-    #draw_text(
-    #    1, 7, RED,
-    #    f"MIL {mil_count:02d}"
-    #)
-
-    #draw_text(
-    #    53, 7, WHITE,
-    #    f"{count:02d}"[-2:]
-    #)
-
-    if error:
-
-        draw_text(1, 30, RED, "API ERROR")
-        draw_text(1, 42, GREY, "RETRYING")
-
-    elif count == 0:
-
-        draw_text(1, 29, YELLOW, "NO AIRCRAFT")
-        draw_text(1, 41, GREY, "IN 10 NM")
-
-    else:
-
-        start = page * 2
-        visible = aircraft[start:start + 2]
-
-        if not visible:
-            visible = aircraft[:2]
-
-        draw_aircraft(visible[0], 8)
-
-        if len(visible) > 1:
-            draw_aircraft(visible[1], 39)
+    draw_local_panel(aircraft, page, error)
+    draw_military_panel(aircraft)
+    # Visible provider attribution (adsb.fi requests its name and homepage link).
+    draw_text(66, 63, GREY, "ADSB.FI / LOL")
 
     return matrix.SwapOnVSync(canvas)
 
@@ -691,16 +893,25 @@ def main():
 
     retry_delay = REFRESH_SECONDS
     next_refresh = 0
+    provider_index = 0
 
     api_error = False
+
+    global AIRCRAFT_REGISTRY
+    AIRCRAFT_REGISTRY = load_aircraft_registry()
 
     print("Aircraft display starting")
     print("Coverage:", RADIUS_NM, "NM")
     print("Location:", LAT, LON)
     print("Sightings database:", DB_FILE)
     print("Raw API observation logging: enabled")
+    print("Rotating providers:", ", ".join(p["name"] for p in API_PROVIDERS))
+    print("Provider attribution: https://adsb.fi/ and https://adsb.lol/")
     print("Point feed: all returned records")
     print("Military feed: positioned aircraft within", RADIUS_NM, "NM")
+    print("Matrix: 128x64 (two chained 64x64 panels)")
+    print("Retention: non-military raw observations older than 7 days")
+    purge_old_non_mil_observations()
 
     while True:
 
@@ -708,11 +919,16 @@ def main():
 
         if now >= next_refresh:
 
+            provider = API_PROVIDERS[provider_index % len(API_PROVIDERS)]
+            provider_index += 1
+
             try:
-                aircraft = get_aircraft()
+                print(time.strftime("%H:%M:%S"), "Polling", provider["name"])
+                aircraft = get_aircraft(provider)
 
                 api_error = False
                 page = 0
+                last_page = time.monotonic()
 
                 log_sightings(aircraft)
 
@@ -770,10 +986,7 @@ def main():
             page += 1
             last_page = now
 
-        pages = max(
-            1,
-            (len(aircraft) + 1) // 2
-        )
+        pages = max(1, len(aircraft))
 
         page %= pages
 
